@@ -7,11 +7,31 @@ is the one and only source of truth -- there is no in-memory fallback store.
 
 from __future__ import annotations
 
+import contextvars
 from typing import Any, Iterable
 
 from falkordb import FalkorDB
 
 from app.config import settings
+
+# Per-request log of executed Cypher, surfaced in the observability panel.
+_query_log: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "nexus_query_log", default=None
+)
+
+
+def start_query_log():
+    return _query_log.set([])
+
+
+def stop_query_log(token) -> list[str]:
+    logged = _query_log.get() or []
+    _query_log.reset(token)
+    return logged
+
+
+def current_query_log() -> list[str]:
+    return list(_query_log.get() or [])
 
 
 class FalkorDBUnavailable(RuntimeError):
@@ -44,6 +64,9 @@ def get_graph(name: str | None = None):
 
 def run(cypher: str, params: dict[str, Any] | None = None) -> list[list[Any]]:
     """Execute Cypher and return the raw ``result_set`` rows."""
+    log = _query_log.get()
+    if log is not None:
+        log.append(" ".join(cypher.split()))
     try:
         result = get_graph().query(cypher, params or {})
     except Exception as exc:

@@ -12,6 +12,7 @@ module never claims a number it did not actually write.
 
 from __future__ import annotations
 
+import json
 import random
 from datetime import datetime, timedelta, timezone
 
@@ -35,11 +36,14 @@ class Builder:
         self.prop_edges: list[dict] = []
 
     def node(self, label: str, id: str, **props) -> tuple[str, str]:
+        bucket = self.nodes.setdefault(label, [])
+        if any(r["id"] == id for r in bucket):  # guard against silent duplicates
+            raise ValueError(f"duplicate {label} id: {id}")
         row = {"id": id}
         for k, v in props.items():
             if v is not None:
                 row[k] = v
-        self.nodes.setdefault(label, []).append(row)
+        bucket.append(row)
         return (label, id)
 
     def edge(self, src: tuple[str, str], rel: str, dst: tuple[str, str]) -> None:
@@ -78,6 +82,7 @@ TEAMS = [
 SYSTEMS = [
     ("sys-payments", "Payments Platform", "money movement"),
     ("sys-checkout", "Checkout Platform", "purchase flow"),
+    ("sys-platform", "Platform Services", "shared platform primitives"),
     ("sys-identity", "Identity Platform", "auth & accounts"),
     ("sys-notifications", "Notification Platform", "email/sms/push"),
     ("sys-search", "Search Platform", "catalog discovery"),
@@ -90,7 +95,7 @@ SYSTEMS = [
 
 # (id, name, system, team, criticality, tx_per_hour, p99_ms, description, slo)
 SERVICES = [
-    ("svc-checkout", "Checkout API", "sys-checkout", "team-checkout", "critical", 180000, 240, "Orchestrates the end-to-end purchase flow.", "99.95%"),
+    ("svc-checkout", "Checkout Service", "sys-checkout", "team-checkout", "critical", 180000, 240, "Orchestrates the end-to-end purchase flow.", "99.95%"),
     ("svc-payments", "Payment Service", "sys-payments", "team-payments", "critical", 120000, 310, "Authorises and captures customer payments.", "99.99%"),
     ("svc-identity", "Identity Service", "sys-identity", "team-identity", "critical", 150000, 120, "Authentication, sessions and account lookup.", "99.99%"),
     ("svc-ledger", "Ledger Service", "sys-ledger", "team-ledger", "critical", 60000, 180, "Double-entry ledger for every money movement.", "99.99%"),
@@ -384,7 +389,11 @@ def build_dataset() -> Builder:
         ("svc-webhook", "db-notify"),
     ]
     for src, dst in backbone:
-        b.edge((S.SERVICE, src), S.DEPENDS_ON, (S.SERVICE, dst))
+        # Endpoints may be services or databases -- resolve the real label so
+        # the dependency edge is actually created (never silently dropped).
+        slabel = S.DATABASE if src.startswith("db-") else S.SERVICE
+        dlabel = S.DATABASE if dst.startswith("db-") else S.SERVICE
+        b.edge((slabel, src), S.DEPENDS_ON, (dlabel, dst))
 
     # Extra random-but-deterministic edges between services (kept acyclic-ish).
     for i, sid in enumerate(service_ids):
@@ -566,7 +575,8 @@ def _build_incidents(rng: random.Random, b: Builder) -> list[str]:
     statuses = ["resolved"] * 30 + ["mitigated"] * 6 + ["investigating"] * 3 + ["open"] * 3
     severities = ["sev1", "sev2", "sev3", "sev4"]
     for i in range(115):
-        idx = 100 + i
+        # 300+ keeps bulk ids clear of the hand-authored hero incidents.
+        idx = 300 + i
         iid = f"inc-{idx}"
         svc = rng.choice(service_ids)
         status = rng.choice(statuses)
@@ -662,14 +672,30 @@ def _build_documents_and_actions(
         b.edge((S.DECISION, did), S.DECIDED_BY, (S.PERSON, rng.choice(PEOPLE)[0]))
         b.edge((S.DECISION, did), S.DERIVED_FROM, (S.INCIDENT, inc))
     # A prior decision about inc-142 so "why did the recommendation change"
-    # has a genuine baseline to compare against.
+    # has a genuine baseline to compare against even on the very first call.
+    baseline_snapshot = {
+        "incident_id": "inc-142",
+        "priority": "HIGH",
+        "score": 82.0,
+        "recommend_human_review": False,
+        "confidence": 0.89,
+        "risk_factors": [
+            {"factor": "service_criticality", "detail": "Affected service is critical", "weight": 40},
+            {"factor": "transaction_volume", "detail": "Affected service handles 120,000 transactions/hour", "weight": 12.0},
+            {"factor": "historical_precedent", "detail": "inc-91 caused $2,300,000 in revenue loss", "weight": 20},
+            {"factor": "blast_radius", "detail": "12 downstream services depend on the affected service", "weight": 10},
+        ],
+    }
     b.node(
         S.DECISION, "dec-142-seed",
         question="What is the most dangerous unresolved incident?",
+        question_key="most_dangerous_incident",
         answer="inc-142 priority=HIGH, recommend_human_review=false",
-        confidence=0.81,
+        confidence=0.89,
         at=_ts(NOW - timedelta(hours=2, minutes=40)),
         session="seed", kind="decision", priority="HIGH",
+        recommend_human_review=False,
+        snapshot_json=json.dumps(baseline_snapshot),
     )
     b.edge((S.DECISION, "dec-142-seed"), S.BASED_ON, (S.INCIDENT, "inc-142"))
     b.edge((S.DECISION, "dec-142-seed"), S.BASED_ON, (S.SERVICE, "svc-payments"))
@@ -702,6 +728,10 @@ def _build_documents_and_actions(
 
     # ---- Events ----------------------------------------------------------
     kinds = ["deploy", "metric", "alert", "scale", "config_change", "error_spike", "rollback", "failover"]
+    # Random events may trigger bulk incidents, never the hand-authored hero
+    # incidents -- those keep a curated causal story.
+    hero = {"inc-142", "inc-91", "inc-77", "inc-63", "inc-54"}
+    trigger_pool = [i for i in incident_ids if i not in hero]
     for i in range(600):
         eid = f"evt-{i:04d}"
         svc = rng.choice(service_ids)
@@ -717,9 +747,9 @@ def _build_documents_and_actions(
         )
         b.edge((S.EVENT, eid), S.AFFECTS, (S.SERVICE, svc))
         if rng.random() < 0.35:
-            b.edge((S.EVENT, eid), S.TRIGGERED, (S.INCIDENT, rng.choice(incident_ids)))
+            b.edge((S.EVENT, eid), S.TRIGGERED, (S.INCIDENT, rng.choice(trigger_pool)))
         if rng.random() < 0.5:
-            b.edge((S.EVENT, eid), S.RELATED_TO, (S.INCIDENT, rng.choice(incident_ids)))
+            b.edge((S.EVENT, eid), S.RELATED_TO, (S.INCIDENT, rng.choice(trigger_pool)))
 
     # Hero events for #142
     for eid, summary, val, unit, sev in [
@@ -743,6 +773,21 @@ def _build_documents_and_actions(
 # ---------------------------------------------------------------------------
 
 def _write(g, b: Builder) -> None:
+    # Validate every edge endpoint exists -- a typo must fail loudly rather
+    # than silently writing a partial graph.
+    existing = {(label, r["id"]) for label, rows in b.nodes.items() for r in rows}
+    missing = []
+    for src, _rel, dst in b.edges:
+        for endpoint in (src, dst):
+            if endpoint not in existing:
+                missing.append(endpoint)
+    for e in b.prop_edges:
+        for endpoint in (e["src"], e["dst"]):
+            if endpoint not in existing:
+                missing.append(endpoint)
+    if missing:
+        raise ValueError(f"edges reference unknown nodes: {sorted(set(missing))[:10]}")
+
     for label, rows in b.nodes.items():
         if not rows:
             continue
