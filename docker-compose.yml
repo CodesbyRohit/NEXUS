@@ -1,0 +1,22 @@
+# NEXUS local stack: FalkorDB graph database.
+#
+#   docker compose up -d
+#
+# FalkorDB exposes the Redis protocol on 6379 with the graph module loaded.
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: nexus-falkordb
+    ports:
+      - "6379:6379"
+    volumes:
+      - falkor-data:/data
+    command: ["--save", "60", "1", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  falkor-data:
