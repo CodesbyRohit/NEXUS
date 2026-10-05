@@ -294,47 +294,79 @@ def build_evidence_path(incident_id: str, facts: dict[str, Any] | None = None) -
             why = f"affected service (criticality={node['props'].get('criticality')})"
         hop(inc, S.AFFECTS, node, why)
 
+    def resolve(node_id: str) -> dict | None:
+        if node_id in nodes:
+            return nodes[node_id]
+        node = T.get_node(node_id)
+        if node:
+            nodes[node_id] = node
+        return node
+
+    def hop_along(src_id: str, dst_id: str, why: str) -> None:
+        """Emit the real edges of a src->dst dependency path (never invented)."""
+        for seg in T.dependency_path(src_id, dst_id):
+            src_node, dst_node = resolve(seg["from"]), resolve(seg["to"])
+            if src_node and dst_node:
+                hop(src_node, seg["rel"], dst_node, why)
+
     primary = facts["primary_service"]
     if primary:
-        # 2. The affected service's critical dependencies.
+        # 2. The affected service's critical dependencies (real edges only).
         for dep in sorted(
             facts["dependencies"],
             key=lambda d: (0 if d["label"] == S.DATABASE else 1, d["hops"]),
         )[:3]:
-            hop(primary, S.DEPENDS_ON, dep,
-                f"{dep['label'].lower()} dependency {dep['hops']} hop(s) away")
+            why = f"{dep['label'].lower()} dependency {dep['hops']} hop(s) away"
+            if dep["hops"] == 1:
+                hop(primary, S.DEPENDS_ON, dep, why)
+            else:
+                hop_along(primary["id"], dep["id"], why)
         # 3. Blast radius: services that depend on the affected service.
         for dep in sorted(facts["dependents"], key=lambda d: d["hops"])[:3]:
-            hop(dep, S.DEPENDS_ON, primary,
-                f"{dep['name']} depends on the affected service (handles "
-                f"{dep['props'].get('tx_per_hour', 0):,} tx/hour)")
+            why = (f"{dep['name']} depends on the affected service (handles "
+                   f"{dep['props'].get('tx_per_hour', 0):,} tx/hour)")
+            if dep["hops"] == 1:
+                hop(dep, S.DEPENDS_ON, primary, why)
+            else:
+                hop_along(dep["id"], primary["id"], why)
 
-    # 4. Exposed APIs and the business outcomes they reach.
+    # 4. Exposed APIs and the business outcomes they *actually* reach.
     for api in facts["exposed_apis"][:4]:
-        hop({"id": api["via_service"], "label": S.SERVICE, "name": api["via_service"]},
-            S.SUPPORTS, api, "public contract on the transaction path")
-        for im in facts["impacts"][:2]:
-            hop(api, S.IMPACTS, {"id": im["id"], "label": S.IMPACT, "name": im["name"]},
-                f"business impact (severity={im['severity']})")
+        owner = resolve(api["via_service"])
+        if owner:
+            hop(owner, S.SUPPORTS, api, "public contract on the transaction path")
+        impacts = client.run(
+            "MATCH (a:API {id: $id})-[:IMPACTS]->(im:Impact) "
+            "RETURN im.id, im.name, coalesce(im.severity, '') LIMIT 2",
+            {"id": api["id"]},
+        )
+        for iid, iname, sev in impacts:
+            hop(api, S.IMPACTS, {"id": iid, "label": S.IMPACT, "name": iname},
+                f"business impact (severity={sev or 'n/a'})")
 
-    # 5. Historical precedent that caused real impact.
+    # 5. Historical precedent that caused real impact (real edges, real direction).
+    precedent_rels = [S.RELATED_TO, S.PRECEDED, S.FOLLOWED, S.CONTRADICTS]
     for p in facts["precedents"][:3]:
-        if p["id"] != inc["id"]:
-            hop({"id": p["id"], "label": S.INCIDENT, "name": p["title"]},
-                S.RELATED_TO, inc, f"historical precedent ({p['status']})")
+        if p["id"] == inc["id"]:
+            continue
+        for seg in T.edge_between(inc["id"], p["id"], precedent_rels):
+            src_n, dst_n = resolve(seg["from"]), resolve(seg["to"])
+            if src_n and dst_n:
+                hop(src_n, seg["rel"], dst_n, f"historical precedent ({p['status']})")
         for c in p.get("caused", []):
             if c.get("amount_usd", 0) > 0:
-                hop({"id": p["id"], "label": S.INCIDENT, "name": p["title"]},
-                    S.CAUSED, {"id": c["id"], "label": S.IMPACT, "name": c["name"]},
-                    f"caused ${c['amount_usd']:,} impact")
+                for seg in T.edge_between(p["id"], c["id"], [S.CAUSED]):
+                    src_n, dst_n = resolve(seg["from"]), resolve(seg["to"])
+                    if src_n and dst_n:
+                        hop(src_n, seg["rel"], dst_n, f"caused ${c['amount_usd']:,} impact")
 
     # 6. Newly written traffic evidence (memory) if present.
     for e in facts.get("traffic_events", []):
-        target = nodes.get(e["target"]) or T.get_node(e["target"])
-        if target is None:
-            continue
-        hop({"id": e["id"], "label": S.EVENT, "name": e["summary"]},
-            S.AFFECTS, target, f"new graph evidence: {e['value']:g}{e['unit']}")
+        for seg in T.edge_between(e["id"], e["target"], [S.AFFECTS]):
+            src_n, dst_n = resolve(seg["from"]), resolve(seg["to"])
+            if src_n and dst_n:
+                hop(src_n, seg["rel"], dst_n,
+                    f"new graph evidence: {e['value']:g}{e['unit']}")
 
     # De-duplicate edges for the visualiser.
     seen = set()

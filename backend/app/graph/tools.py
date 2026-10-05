@@ -118,14 +118,16 @@ def traverse_graph(
     rel_expr = f":{'|'.join(rels)}" if rels else ""
     depth = max(1, min(int(depth), 4))
     cypher = (
-        f"MATCH (s {{id: $id}}) "
-        f"MATCH (s){_path_pattern(pattern_dir, rel_expr, depth)}(m) "
+        f"MATCH p = (s {{id: $id}})"
+        f"{_path_pattern(pattern_dir, rel_expr, depth)}(m) "
         f"RETURN DISTINCT m.id, labels(m), properties(m) LIMIT $limit"
     )
     rows = client.run(cypher, {"id": start_id, "limit": limit})
     nodes = {start_id: get_node(start_id)}
     ids = set(nodes.keys())
-    for labels_, mid, props in rows:
+    for mid, labels_, props in rows:  # RETURN order: id, labels(m), properties(m)
+        if not isinstance(mid, str):  # defensive: skip unexpected shapes
+            continue
         nodes[mid] = node_dict((labels_ or ["Unknown"])[0], mid, props)
         ids.add(mid)
 
@@ -179,6 +181,47 @@ def find_dependencies(service_id: str, depth: int = 3) -> dict[str, Any]:
             best[did] = {**node_dict((labs or ["Unknown"])[0], did, props), "hops": hops}
     deps = sorted(best.values(), key=lambda d: (d["hops"], d["id"]))
     return {"entity": service_id, "dependencies": deps, "count": len(deps)}
+
+
+def edge_between(a_id: str, b_id: str, rels: list[str] | None = None) -> list[dict]:
+    """Return the real edges between two nodes in either direction.
+
+    Guarantees that a cited relationship exists *and* has the stated direction.
+    """
+    rel_expr = f":{'|'.join(rels)}" if rels else ""
+    out: list[dict] = []
+    for cypher, params in (
+        (f"MATCH (a {{id:$a}})-[r{rel_expr}]->(b {{id:$b}}) RETURN a.id, type(r), b.id",
+         {"a": a_id, "b": b_id}),
+        (f"MATCH (b {{id:$b}})-[r{rel_expr}]->(a {{id:$a}}) RETURN b.id, type(r), a.id",
+         {"a": a_id, "b": b_id}),
+    ):
+        for s, rel, t in client.run(cypher, params):
+            out.append({"from": s, "rel": rel, "to": t})
+    return out
+
+
+def dependency_path(src_id: str, dst_id: str, max_depth: int = 3) -> list[dict]:
+    """Return the concrete DEPENDS_ON edges along a real path src -> dst.
+
+    Used so an evidence path never cites an edge that does not exist.
+    """
+    rows = client.run(
+        f"MATCH p = (a {{id: $a}})-[:DEPENDS_ON*1..{max_depth}]->(b {{id: $b}}) "
+        f"RETURN nodes(p), relationships(p) "
+        f"ORDER BY length(p) LIMIT 1",
+        {"a": src_id, "b": dst_id},
+    )
+    if not rows:
+        return []
+    path_nodes, path_rels = rows[0]
+    ids = [getattr(n, "properties", {}).get("id") for n in path_nodes]
+    rel_types = [getattr(r, "relation", None) for r in path_rels]
+    segments = []
+    for i, rel in enumerate(rel_types):
+        if i + 1 < len(ids) and ids[i] and ids[i + 1]:
+            segments.append({"from": ids[i], "rel": rel, "to": ids[i + 1]})
+    return segments
 
 
 def find_dependents(service_id: str, depth: int = 3) -> dict[str, Any]:
